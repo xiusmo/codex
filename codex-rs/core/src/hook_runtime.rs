@@ -13,6 +13,9 @@ use codex_hooks::PostToolUseRequest;
 use codex_hooks::PreToolUseOutcome;
 use codex_hooks::PreToolUseRequest;
 use codex_hooks::SessionStartOutcome;
+use codex_hooks::SessionStartTarget;
+use codex_hooks::StopHookTarget;
+use codex_hooks::StopOutcome;
 use codex_hooks::UserPromptSubmitOutcome;
 use codex_hooks::UserPromptSubmitRequest;
 use codex_otel::HOOK_RUN_DURATION_METRIC;
@@ -28,6 +31,8 @@ use codex_protocol::protocol::HookRunStatus;
 use codex_protocol::protocol::HookRunSummary;
 use codex_protocol::protocol::HookSource;
 use codex_protocol::protocol::HookStartedEvent;
+use codex_protocol::protocol::SessionSource;
+use codex_protocol::protocol::SubAgentSource;
 use codex_protocol::user_input::UserInput;
 use serde_json::Value;
 
@@ -114,6 +119,25 @@ pub(crate) async fn run_pending_session_start_hooks(
         return false;
     };
 
+    let target = match &turn_context.session_source {
+        SessionSource::SubAgent(SubAgentSource::ThreadSpawn { .. })
+            if matches!(
+                session_start_source,
+                codex_hooks::SessionStartSource::Startup
+            ) =>
+        {
+            let metadata = subagent_hook_metadata(sess, turn_context);
+            SessionStartTarget::SubagentStart {
+                turn_id: turn_context.sub_id.clone(),
+                agent_id: metadata.agent_id,
+                agent_type: metadata.agent_type,
+            }
+        }
+        SessionSource::SubAgent(_) => return false,
+        _ => SessionStartTarget::SessionStart {
+            source: session_start_source,
+        },
+    };
     let request = codex_hooks::SessionStartRequest {
         session_id: sess.session_id().into(),
         #[allow(deprecated)]
@@ -121,7 +145,7 @@ pub(crate) async fn run_pending_session_start_hooks(
         transcript_path: sess.hook_transcript_path().await,
         model: turn_context.model_info.slug.clone(),
         permission_mode: hook_permission_mode(turn_context),
-        source: session_start_source,
+        target,
     };
     let hooks = sess.hooks();
     let preview_runs = hooks.preview_session_start(&request);
@@ -269,6 +293,42 @@ pub(crate) async fn run_post_tool_use_hooks(
 
     let outcome = hooks.run_post_tool_use(request).await;
     emit_hook_completed_events(sess, turn_context, outcome.hook_events.clone()).await;
+    outcome
+}
+
+pub(crate) async fn run_turn_stop_hooks(
+    sess: &Arc<Session>,
+    turn_context: &Arc<TurnContext>,
+    stop_hook_active: bool,
+    last_assistant_message: Option<String>,
+) -> StopOutcome {
+    let target = match &turn_context.session_source {
+        SessionSource::SubAgent(_) => {
+            let metadata = subagent_hook_metadata(sess, turn_context);
+            StopHookTarget::SubagentStop {
+                agent_id: metadata.agent_id,
+                agent_type: metadata.agent_type,
+            }
+        }
+        _ => StopHookTarget::Stop,
+    };
+    let request = codex_hooks::StopRequest {
+        session_id: sess.session_id().into(),
+        turn_id: turn_context.sub_id.clone(),
+        #[allow(deprecated)]
+        cwd: turn_context.cwd.clone(),
+        transcript_path: sess.hook_transcript_path().await,
+        model: turn_context.model_info.slug.clone(),
+        permission_mode: hook_permission_mode(turn_context),
+        stop_hook_active,
+        last_assistant_message,
+        target,
+    };
+    let hooks = sess.hooks();
+    emit_hook_started_events(sess, turn_context, hooks.preview_stop(&request)).await;
+
+    let mut outcome = hooks.run_stop(request).await;
+    emit_hook_completed_events(sess, turn_context, std::mem::take(&mut outcome.hook_events)).await;
     outcome
 }
 
@@ -555,6 +615,8 @@ fn hook_run_metric_tags(run: &HookRunSummary) -> [(&'static str, &'static str); 
         HookEventName::PostCompact => "PostCompact",
         HookEventName::SessionStart => "SessionStart",
         HookEventName::UserPromptSubmit => "UserPromptSubmit",
+        HookEventName::SubagentStart => "SubagentStart",
+        HookEventName::SubagentStop => "SubagentStop",
         HookEventName::Stop => "Stop",
     };
     let hook_source = match run.source {
@@ -593,6 +655,37 @@ fn hook_permission_mode(turn_context: &TurnContext) -> String {
         | AskForApproval::Granular(_) => "default",
     }
     .to_string()
+}
+
+struct SubagentHookMetadata {
+    agent_id: String,
+    agent_type: String,
+}
+
+fn subagent_hook_metadata(sess: &Arc<Session>, turn_context: &TurnContext) -> SubagentHookMetadata {
+    let agent_type = match &turn_context.session_source {
+        SessionSource::SubAgent(subagent_source) => subagent_hook_agent_type(subagent_source),
+        _ => crate::agent::role::DEFAULT_ROLE_NAME.to_string(),
+    };
+    SubagentHookMetadata {
+        agent_id: sess.thread_id().to_string(),
+        agent_type,
+    }
+}
+
+// Hook `agent_type` mirrors the spawn_agent `agent_type` argument. Internally,
+// thread-spawned agents store that value as `agent_role`; omitted values use
+// the default role, while system subagents expose fixed type labels.
+fn subagent_hook_agent_type(subagent_source: &SubAgentSource) -> String {
+    match subagent_source {
+        SubAgentSource::ThreadSpawn { agent_role, .. } => agent_role
+            .clone()
+            .unwrap_or_else(|| crate::agent::role::DEFAULT_ROLE_NAME.to_string()),
+        SubAgentSource::Review => "review".to_string(),
+        SubAgentSource::Compact => "compact".to_string(),
+        SubAgentSource::MemoryConsolidation => "memory_consolidation".to_string(),
+        SubAgentSource::Other(value) => value.clone(),
+    }
 }
 
 fn compaction_trigger_label(value: CompactionTrigger) -> &'static str {
