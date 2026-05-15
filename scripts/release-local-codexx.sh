@@ -38,11 +38,7 @@ rm -rf "$dist_dir"
 mkdir -p "$stage_dir"
 
 echo "==> Building codexx for $target"
-cargo build \
-  --manifest-path codex-rs/Cargo.toml \
-  -p codex-cli \
-  --bin codex \
-  --release
+(cd codex-rs && cargo build -p codex-cli --bin codex --release)
 
 cp codex-rs/target/release/codex "$stage_dir/codex"
 chmod 0755 "$stage_dir/codex"
