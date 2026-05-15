@@ -3007,6 +3007,13 @@ impl Session {
     }
 
     pub(crate) async fn record_rate_limits_info(&self, new_rate_limits: RateLimitSnapshot) {
+        if let Err(err) = self
+            .services
+            .auth_manager
+            .record_current_account_rate_limits(new_rate_limits.clone())
+        {
+            debug!("failed to record multi-account rate limits: {err}");
+        }
         {
             let mut state = self.state.lock().await;
             state.set_rate_limits(new_rate_limits);

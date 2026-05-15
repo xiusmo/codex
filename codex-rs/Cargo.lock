@@ -2242,6 +2242,7 @@ dependencies = [
  "codex-memories-write",
  "codex-model-provider",
  "codex-models-manager",
+ "codex-multi-account",
  "codex-plugin",
  "codex-protocol",
  "codex-responses-api-proxy",
@@ -3043,6 +3044,7 @@ dependencies = [
  "codex-config",
  "codex-keyring-store",
  "codex-model-provider-info",
+ "codex-multi-account",
  "codex-otel",
  "codex-protocol",
  "codex-terminal-detection",
@@ -3295,6 +3297,17 @@ dependencies = [
  "tempfile",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "codex-multi-account"
+version = "0.0.0"
+dependencies = [
+ "codex-protocol",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
 ]
 
 [[package]]

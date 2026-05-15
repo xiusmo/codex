@@ -38,10 +38,13 @@ use crate::token_data::parse_chatgpt_jwt_claims;
 use crate::token_data::parse_jwt_expiration;
 use codex_client::CodexHttpClient;
 use codex_config::types::AuthCredentialsStoreMode;
+use codex_multi_account::MultiAccountError;
+use codex_multi_account::MultiAccountStore;
 use codex_protocol::account::PlanType as AccountPlanType;
 use codex_protocol::auth::PlanType as InternalPlanType;
 use codex_protocol::auth::RefreshTokenFailedError;
 use codex_protocol::auth::RefreshTokenFailedReason;
+use codex_protocol::protocol::RateLimitSnapshot;
 use serde_json::Value;
 use thiserror::Error;
 
@@ -1788,6 +1791,48 @@ impl AuthManager {
             self.auth_mode(),
             Some(AuthMode::Chatgpt | AuthMode::ChatgptAuthTokens | AuthMode::AgentIdentity)
         )
+    }
+
+    pub fn multi_account_store(&self) -> MultiAccountStore {
+        MultiAccountStore::new(&self.codex_home)
+    }
+
+    pub fn record_current_account_rate_limits(
+        &self,
+        snapshot: RateLimitSnapshot,
+    ) -> std::io::Result<()> {
+        self.multi_account_store()
+            .record_active_rate_limits(snapshot)
+            .map_err(std::io::Error::other)
+    }
+
+    pub async fn switch_account_after_usage_limit(
+        &self,
+        exhausted_until: Option<i64>,
+        last_rate_limits: Option<RateLimitSnapshot>,
+    ) -> std::io::Result<Option<String>> {
+        let outcome = match self
+            .multi_account_store()
+            .mark_active_exhausted_and_switch(exhausted_until, last_rate_limits)
+        {
+            Ok(Some(outcome)) => outcome,
+            Ok(None) | Err(MultiAccountError::AllAccountsExhausted) => return Ok(None),
+            Err(err) => return Err(std::io::Error::other(err)),
+        };
+        let auth_dot_json: AuthDotJson =
+            serde_json::from_value(outcome.auth).map_err(std::io::Error::other)?;
+        save_auth(
+            &self.codex_home,
+            &auth_dot_json,
+            self.auth_credentials_store_mode,
+        )?;
+        self.reload().await;
+        tracing::info!(
+            "Switched Codex account after usage limit: {} -> {}",
+            outcome.previous,
+            outcome.selected
+        );
+        Ok(Some(outcome.selected))
     }
 
     fn is_stale_for_proactive_refresh(auth: &CodexAuth) -> bool {

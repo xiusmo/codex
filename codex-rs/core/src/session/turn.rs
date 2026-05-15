@@ -1087,9 +1087,29 @@ async fn run_sampling_request(
                 return Err(CodexErr::ContextWindowExceeded);
             }
             Err(CodexErr::UsageLimitReached(e)) => {
-                let rate_limits = e.rate_limits.clone();
-                if let Some(rate_limits) = rate_limits {
-                    sess.update_rate_limits(&turn_context, *rate_limits).await;
+                let rate_limits = e.rate_limits.as_ref().map(|limits| (**limits).clone());
+                if let Some(rate_limits) = rate_limits.clone() {
+                    sess.update_rate_limits(&turn_context, rate_limits).await;
+                }
+                let exhausted_until = e.resets_at.as_ref().map(|resets_at| resets_at.timestamp());
+                match sess
+                    .services
+                    .auth_manager
+                    .switch_account_after_usage_limit(exhausted_until, rate_limits)
+                    .await
+                {
+                    Ok(Some(account_name)) => {
+                        tracing::info!(
+                            "Usage limit reached; switched to account `{account_name}` and retrying turn"
+                        );
+                        client_session.reset_websocket_session();
+                        retries = 0;
+                        continue;
+                    }
+                    Ok(None) => {}
+                    Err(err) => {
+                        warn!("failed to switch account after usage limit: {err}");
+                    }
                 }
                 return Err(CodexErr::UsageLimitReached(e));
             }

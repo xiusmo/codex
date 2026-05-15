@@ -10,11 +10,13 @@ use codex_arg0::Arg0DispatchPaths;
 use codex_arg0::arg0_dispatch_or_else;
 use codex_chatgpt::apply_command::ApplyCommand;
 use codex_chatgpt::apply_command::run_apply_command;
+use codex_cli::AccountsCommand;
 use codex_cli::LandlockCommand;
 use codex_cli::SeatbeltCommand;
 use codex_cli::WindowsCommand;
 use codex_cli::read_access_token_from_stdin;
 use codex_cli::read_api_key_from_stdin;
+use codex_cli::run_accounts;
 use codex_cli::run_login_status;
 use codex_cli::run_login_with_access_token;
 use codex_cli::run_login_with_api_key;
@@ -126,6 +128,10 @@ enum Subcommand {
 
     /// Remove stored authentication credentials.
     Logout(LogoutCommand),
+
+    /// Manage saved Codex accounts for automatic usage-limit failover.
+    #[clap(visible_alias = "account")]
+    Accounts(AccountsCommand),
 
     /// Manage external MCP servers for Codex.
     Mcp(McpCli),
@@ -1201,6 +1207,18 @@ async fn cli_main(arg0_paths: Arg0DispatchPaths) -> anyhow::Result<()> {
             );
             run_logout(logout_cli.config_overrides).await;
         }
+        Some(Subcommand::Accounts(mut accounts_cli)) => {
+            reject_remote_mode_for_subcommand(
+                root_remote.as_deref(),
+                root_remote_auth_token_env.as_deref(),
+                "accounts",
+            )?;
+            prepend_config_flags(
+                &mut accounts_cli.config_overrides,
+                root_config_overrides.clone(),
+            );
+            run_accounts(accounts_cli).await;
+        }
         Some(Subcommand::Completion(completion_cli)) => {
             reject_remote_mode_for_subcommand(
                 root_remote.as_deref(),
@@ -1811,6 +1829,7 @@ fn unsupported_subcommand_name_for_strict_config(
         Some(Subcommand::App(_)) => Some("app"),
         Some(Subcommand::Login(_)) => Some("login"),
         Some(Subcommand::Logout(_)) => Some("logout"),
+        Some(Subcommand::Accounts(_)) => Some("accounts"),
         Some(Subcommand::Completion(_)) => Some("completion"),
         Some(Subcommand::Update) => Some("update"),
         Some(Subcommand::Cloud(_)) => Some("cloud"),
