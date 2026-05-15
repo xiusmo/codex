@@ -1,9 +1,6 @@
 name: codexx-release
 
 on:
-  push:
-    tags:
-      - "codexx-v*.*.*"
   workflow_dispatch:
 
 permissions:

@@ -39,6 +39,12 @@ git tag -a codexx-v0.1.0 -m "Release codexx 0.1.0"
 git push origin codexx-v0.1.0
 ```
 
-The fork-specific workflow at `.github/workflows/codexx-release.yml` builds the
-CLI and uploads release assets. It does not use OpenAI's official signing, npm,
-PyPI, Winget, DotSlash, or website publishing pipeline.
+Then build and upload the current machine's native artifact:
+
+```sh
+scripts/release-local-codexx.sh codexx-v0.1.0
+```
+
+The fork-specific workflow at `.github/workflows/codexx-release.yml` is kept as
+a manual fallback only. It does not use OpenAI's official signing, npm, PyPI,
+Winget, DotSlash, or website publishing pipeline.
