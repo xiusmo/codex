@@ -13,36 +13,41 @@ Upstream-facing integration points are intentionally small:
 Save the current login as a named account:
 
 ```sh
-codex login
-codex accounts add main
+codexx login
+codexx accounts add main
 ```
 
 Add another account:
 
 ```sh
-codex logout
-codex login
-codex accounts add backup
+codexx logout
+codexx login
+codexx accounts add backup
 ```
 
 Inspect and switch accounts:
 
 ```sh
-codex accounts list
-codex accounts use main
-codex accounts remove backup
+codexx accounts list
+codexx accounts use main
+codexx accounts remove backup
 ```
 
 When a turn receives a usage-limit error, Codex marks the active account exhausted until the
-server-provided reset time, writes the next available saved account into the normal auth store,
+server-provided reset time, writes the next available saved account into the codexx auth profile,
 resets the websocket session, and retries the turn.
+
+The `codexx` launcher sets `CODEX_AUTH_PROFILE=codexx`. It still uses the normal
+`CODEX_HOME` so config and history follow official Codex, but the active credential lives in
+`$CODEX_HOME/auth-codexx.json` or the matching profiled keyring entry instead of
+`$CODEX_HOME/auth.json`.
 
 ## Rebase Workflow
 
 Keep local work on a feature branch:
 
 ```sh
-git switch multi-account-router
+git switch codexx
 git fetch origin
 git rebase origin/main
 cargo check -p codex-cli

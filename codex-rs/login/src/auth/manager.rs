@@ -29,7 +29,9 @@ pub use crate::auth::agent_identity::AgentIdentityAuth;
 pub use crate::auth::storage::AgentIdentityAuthRecord;
 pub use crate::auth::storage::AuthDotJson;
 use crate::auth::storage::AuthStorageBackend;
+use crate::auth::storage::active_auth_profile;
 use crate::auth::storage::create_auth_storage;
+use crate::auth::storage::create_unprofiled_auth_storage;
 use crate::auth::util::try_parse_error_message;
 use crate::default_client::build_reqwest_client;
 use crate::default_client::create_client;
@@ -774,6 +776,23 @@ async fn load_auth(
     let storage = create_auth_storage(codex_home.to_path_buf(), auth_credentials_store_mode);
     let auth_dot_json = match storage.load()? {
         Some(auth) => auth,
+        None if active_auth_profile().is_some() => {
+            let unprofiled_storage = create_unprofiled_auth_storage(
+                codex_home.to_path_buf(),
+                auth_credentials_store_mode,
+            );
+            match unprofiled_storage.load()? {
+                Some(auth) => {
+                    if let Err(err) = storage.save(&auth) {
+                        tracing::warn!(
+                            "Failed to copy default auth into profiled auth storage: {err}"
+                        );
+                    }
+                    auth
+                }
+                None => return Ok(None),
+            }
+        }
         None => return Ok(None),
     };
 

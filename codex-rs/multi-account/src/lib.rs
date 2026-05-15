@@ -12,8 +12,10 @@ use std::path::PathBuf;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 use thiserror::Error;
+use uuid::Uuid;
 
 const STORE_RELATIVE_PATH: &[&str] = &["multi_accounts", "accounts.json"];
+const AUTH_DIR_RELATIVE_PATH: &[&str] = &["multi_accounts", "auth"];
 
 #[derive(Debug, Error)]
 pub enum MultiAccountError {
@@ -21,6 +23,8 @@ pub enum MultiAccountError {
     EmptyName,
     #[error("account `{0}` does not exist")]
     MissingAccount(String),
+    #[error("account `{0}` has no stored auth payload")]
+    MissingAuth(String),
     #[error("no stored accounts are available")]
     NoAccounts,
     #[error("all stored accounts are exhausted")]
@@ -35,8 +39,13 @@ pub type Result<T> = std::result::Result<T, MultiAccountError>;
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct AccountRecord {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
     pub name: String,
-    pub auth: Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_file: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth: Option<Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub added_at: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -67,6 +76,7 @@ pub struct SwitchOutcome {
 #[derive(Clone, Debug)]
 pub struct MultiAccountStore {
     path: PathBuf,
+    auth_dir: PathBuf,
 }
 
 impl MultiAccountStore {
@@ -75,7 +85,11 @@ impl MultiAccountStore {
         for segment in STORE_RELATIVE_PATH {
             path.push(segment);
         }
-        Self { path }
+        let mut auth_dir = codex_home.as_ref().to_path_buf();
+        for segment in AUTH_DIR_RELATIVE_PATH {
+            auth_dir.push(segment);
+        }
+        Self { path, auth_dir }
     }
 
     pub fn path(&self) -> &Path {
@@ -122,19 +136,27 @@ impl MultiAccountStore {
             .find(|account| account.name == name)
         {
             Some(account) => {
-                account.auth = auth;
+                let auth_file = self.write_account_auth(account.id.as_deref(), &auth)?;
+                account.id = auth_id_from_file_name(&auth_file);
+                account.auth_file = Some(auth_file);
+                account.auth = None;
                 account.exhausted_until = None;
                 account.last_selected_at = Some(now);
             }
-            None => state.accounts.push(AccountRecord {
-                name: name.clone(),
-                auth,
-                added_at: Some(now),
-                last_selected_at: Some(now),
-                exhausted_until: None,
-                last_rate_limits: None,
-                last_rate_limits_at: None,
-            }),
+            None => {
+                let auth_file = self.write_account_auth(None, &auth)?;
+                state.accounts.push(AccountRecord {
+                    id: auth_id_from_file_name(&auth_file),
+                    name: name.clone(),
+                    auth_file: Some(auth_file),
+                    auth: None,
+                    added_at: Some(now),
+                    last_selected_at: Some(now),
+                    exhausted_until: None,
+                    last_rate_limits: None,
+                    last_rate_limits_at: None,
+                });
+            }
         }
         state.active = Some(name);
         self.save(&state)
@@ -144,13 +166,26 @@ impl MultiAccountStore {
         let name = normalize_name(name)?;
         let mut state = self.load()?;
         let before = state.accounts.len();
-        state.accounts.retain(|account| account.name != name);
+        let mut removed_auth_files = Vec::new();
+        state.accounts.retain(|account| {
+            if account.name == name {
+                if let Some(auth_file) = account.auth_file.clone() {
+                    removed_auth_files.push(auth_file);
+                }
+                false
+            } else {
+                true
+            }
+        });
         if state.active.as_deref() == Some(&name) {
             state.active = state.accounts.first().map(|account| account.name.clone());
         }
         let removed = state.accounts.len() != before;
         if removed {
             self.save(&state)?;
+            for auth_file in removed_auth_files {
+                let _ = std::fs::remove_file(self.auth_dir.join(auth_file));
+            }
         }
         Ok(removed)
     }
@@ -166,7 +201,8 @@ impl MultiAccountStore {
             .ok_or_else(|| MultiAccountError::MissingAccount(name.clone()))?;
         selected.last_selected_at = Some(now);
         selected.exhausted_until = None;
-        let record = selected.clone();
+        let mut record = selected.clone();
+        record.auth = Some(self.read_account_auth(&record)?);
         state.active = Some(name);
         self.save(&state)?;
         Ok(record)
@@ -225,7 +261,7 @@ impl MultiAccountStore {
             return Err(MultiAccountError::AllAccountsExhausted);
         };
         let selected_name = next.name.clone();
-        let selected_auth = next.auth.clone();
+        let selected_auth = self.read_account_auth(next)?;
         if let Some(account) = state
             .accounts
             .iter_mut()
@@ -240,6 +276,39 @@ impl MultiAccountStore {
             selected: selected_name,
             auth: selected_auth,
         }))
+    }
+
+    fn write_account_auth(&self, id: Option<&str>, auth: &Value) -> Result<String> {
+        std::fs::create_dir_all(&self.auth_dir)?;
+        let id = id
+            .map(str::to_string)
+            .unwrap_or_else(|| Uuid::new_v4().to_string());
+        let file_name = format!("auth-{id}.json");
+        let path = self.auth_dir.join(&file_name);
+        let serialized = serde_json::to_string_pretty(auth)?;
+        let mut options = OpenOptions::new();
+        options.create(true).truncate(true).write(true);
+        #[cfg(unix)]
+        {
+            options.mode(0o600);
+        }
+        let mut file = options.open(path)?;
+        file.write_all(serialized.as_bytes())?;
+        file.flush()?;
+        Ok(file_name)
+    }
+
+    fn read_account_auth(&self, account: &AccountRecord) -> Result<Value> {
+        if let Some(auth_file) = &account.auth_file {
+            let mut file = std::fs::File::open(self.auth_dir.join(auth_file))?;
+            let mut contents = String::new();
+            file.read_to_string(&mut contents)?;
+            return Ok(serde_json::from_str(&contents)?);
+        }
+        account
+            .auth
+            .clone()
+            .ok_or_else(|| MultiAccountError::MissingAuth(account.name.clone()))
     }
 }
 
@@ -271,6 +340,13 @@ fn now_unix() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_secs() as i64)
         .unwrap_or_default()
+}
+
+fn auth_id_from_file_name(file_name: &str) -> Option<String> {
+    file_name
+        .strip_prefix("auth-")
+        .and_then(|value| value.strip_suffix(".json"))
+        .map(str::to_string)
 }
 
 #[cfg(test)]

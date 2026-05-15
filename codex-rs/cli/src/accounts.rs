@@ -55,7 +55,7 @@ pub async fn run_accounts(command: AccountsCommand) -> ! {
             ) {
                 Ok(Some(auth)) => auth,
                 Ok(None) => {
-                    eprintln!("No stored login found. Run `codex login` first.");
+                    eprintln!("No stored login found. Run `codexx login` first.");
                     std::process::exit(1);
                 }
                 Err(err) => {
@@ -102,7 +102,11 @@ pub async fn run_accounts(command: AccountsCommand) -> ! {
                     std::process::exit(1);
                 }
             };
-            let auth = match serde_json::from_value(account.auth) {
+            let Some(account_auth) = account.auth else {
+                eprintln!("Account `{name}` has no stored auth payload");
+                std::process::exit(1);
+            };
+            let auth = match serde_json::from_value(account_auth) {
                 Ok(auth) => auth,
                 Err(err) => {
                     eprintln!("Error decoding account `{name}`: {err}");

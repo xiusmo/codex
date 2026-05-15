@@ -5,6 +5,7 @@ use serde::Serialize;
 use sha2::Digest;
 use sha2::Sha256;
 use std::collections::HashMap;
+use std::env;
 use std::fmt::Debug;
 use std::fs::File;
 use std::fs::OpenOptions;
@@ -27,6 +28,9 @@ use codex_keyring_store::DefaultKeyringStore;
 use codex_keyring_store::KeyringStore;
 use codex_protocol::account::PlanType as AccountPlanType;
 use once_cell::sync::Lazy;
+
+pub const AUTH_PROFILE_ENV_VAR: &str = "CODEX_AUTH_PROFILE";
+const DEFAULT_AUTH_FILE_NAME: &str = "auth.json";
 
 /// Expected structure for $CODEX_HOME/auth.json.
 #[derive(Deserialize, Serialize, Clone, Debug, PartialEq)]
@@ -81,12 +85,42 @@ impl From<AgentIdentityJwtClaims> for AgentIdentityAuthRecord {
     }
 }
 
+#[cfg(test)]
 pub(super) fn get_auth_file(codex_home: &Path) -> PathBuf {
-    codex_home.join("auth.json")
+    auth_file_for_profile(codex_home, None)
+}
+
+pub(super) fn get_active_auth_file(codex_home: &Path) -> PathBuf {
+    auth_file_for_profile(codex_home, active_auth_profile().as_deref())
+}
+
+pub(super) fn active_auth_profile() -> Option<String> {
+    env::var(AUTH_PROFILE_ENV_VAR)
+        .ok()
+        .and_then(|raw| sanitize_auth_profile(&raw))
+}
+
+fn auth_file_for_profile(codex_home: &Path, profile: Option<&str>) -> PathBuf {
+    match profile {
+        Some(profile) => codex_home.join(format!("auth-{profile}.json")),
+        None => codex_home.join(DEFAULT_AUTH_FILE_NAME),
+    }
+}
+
+fn sanitize_auth_profile(raw: &str) -> Option<String> {
+    let profile = raw
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.'))
+        .collect::<String>();
+    if profile.is_empty() {
+        None
+    } else {
+        Some(profile)
+    }
 }
 
 pub(super) fn delete_file_if_exists(codex_home: &Path) -> std::io::Result<bool> {
-    let auth_file = get_auth_file(codex_home);
+    let auth_file = get_active_auth_file(codex_home);
     match std::fs::remove_file(&auth_file) {
         Ok(()) => Ok(true),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
@@ -103,11 +137,15 @@ pub(super) trait AuthStorageBackend: Debug + Send + Sync {
 #[derive(Clone, Debug)]
 pub(super) struct FileAuthStorage {
     codex_home: PathBuf,
+    profile: Option<String>,
 }
 
 impl FileAuthStorage {
-    pub(super) fn new(codex_home: PathBuf) -> Self {
-        Self { codex_home }
+    pub(super) fn new(codex_home: PathBuf, profile: Option<String>) -> Self {
+        Self {
+            codex_home,
+            profile,
+        }
     }
 
     /// Attempt to read and parse the `auth.json` file in the given `CODEX_HOME` directory.
@@ -124,7 +162,7 @@ impl FileAuthStorage {
 
 impl AuthStorageBackend for FileAuthStorage {
     fn load(&self) -> std::io::Result<Option<AuthDotJson>> {
-        let auth_file = get_auth_file(&self.codex_home);
+        let auth_file = auth_file_for_profile(&self.codex_home, self.profile.as_deref());
         let auth_dot_json = match self.try_read_auth_json(&auth_file) {
             Ok(auth) => auth,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -134,7 +172,7 @@ impl AuthStorageBackend for FileAuthStorage {
     }
 
     fn save(&self, auth_dot_json: &AuthDotJson) -> std::io::Result<()> {
-        let auth_file = get_auth_file(&self.codex_home);
+        let auth_file = auth_file_for_profile(&self.codex_home, self.profile.as_deref());
 
         if let Some(parent) = auth_file.parent() {
             std::fs::create_dir_all(parent)?;
@@ -160,13 +198,25 @@ impl AuthStorageBackend for FileAuthStorage {
 const KEYRING_SERVICE: &str = "Codex Auth";
 
 // turns codex_home path into a stable, short key string
+#[cfg(test)]
 fn compute_store_key(codex_home: &Path) -> std::io::Result<String> {
+    compute_store_key_for_profile(codex_home, active_auth_profile().as_deref())
+}
+
+fn compute_store_key_for_profile(
+    codex_home: &Path,
+    profile: Option<&str>,
+) -> std::io::Result<String> {
     let canonical = codex_home
         .canonicalize()
         .unwrap_or_else(|_| codex_home.to_path_buf());
     let path_str = canonical.to_string_lossy();
     let mut hasher = Sha256::new();
     hasher.update(path_str.as_bytes());
+    if let Some(profile) = profile {
+        hasher.update(b"\0");
+        hasher.update(profile.as_bytes());
+    }
     let digest = hasher.finalize();
     let hex = format!("{digest:x}");
     let truncated = hex.get(..16).unwrap_or(&hex);
@@ -176,13 +226,19 @@ fn compute_store_key(codex_home: &Path) -> std::io::Result<String> {
 #[derive(Clone, Debug)]
 struct KeyringAuthStorage {
     codex_home: PathBuf,
+    profile: Option<String>,
     keyring_store: Arc<dyn KeyringStore>,
 }
 
 impl KeyringAuthStorage {
-    fn new(codex_home: PathBuf, keyring_store: Arc<dyn KeyringStore>) -> Self {
+    fn new(
+        codex_home: PathBuf,
+        profile: Option<String>,
+        keyring_store: Arc<dyn KeyringStore>,
+    ) -> Self {
         Self {
             codex_home,
+            profile,
             keyring_store,
         }
     }
@@ -219,12 +275,12 @@ impl KeyringAuthStorage {
 
 impl AuthStorageBackend for KeyringAuthStorage {
     fn load(&self) -> std::io::Result<Option<AuthDotJson>> {
-        let key = compute_store_key(&self.codex_home)?;
+        let key = compute_store_key_for_profile(&self.codex_home, self.profile.as_deref())?;
         self.load_from_keyring(&key)
     }
 
     fn save(&self, auth: &AuthDotJson) -> std::io::Result<()> {
-        let key = compute_store_key(&self.codex_home)?;
+        let key = compute_store_key_for_profile(&self.codex_home, self.profile.as_deref())?;
         // Simpler error mapping per style: prefer method reference over closure
         let serialized = serde_json::to_string(auth).map_err(std::io::Error::other)?;
         self.save_to_keyring(&key, &serialized)?;
@@ -235,7 +291,7 @@ impl AuthStorageBackend for KeyringAuthStorage {
     }
 
     fn delete(&self) -> std::io::Result<bool> {
-        let key = compute_store_key(&self.codex_home)?;
+        let key = compute_store_key_for_profile(&self.codex_home, self.profile.as_deref())?;
         let keyring_removed = self
             .keyring_store
             .delete(KEYRING_SERVICE, &key)
@@ -254,10 +310,18 @@ struct AutoAuthStorage {
 }
 
 impl AutoAuthStorage {
-    fn new(codex_home: PathBuf, keyring_store: Arc<dyn KeyringStore>) -> Self {
+    fn new(
+        codex_home: PathBuf,
+        profile: Option<String>,
+        keyring_store: Arc<dyn KeyringStore>,
+    ) -> Self {
         Self {
-            keyring_storage: Arc::new(KeyringAuthStorage::new(codex_home.clone(), keyring_store)),
-            file_storage: Arc::new(FileAuthStorage::new(codex_home)),
+            keyring_storage: Arc::new(KeyringAuthStorage::new(
+                codex_home.clone(),
+                profile.clone(),
+                keyring_store,
+            )),
+            file_storage: Arc::new(FileAuthStorage::new(codex_home, profile)),
         }
     }
 }
@@ -297,18 +361,22 @@ static EPHEMERAL_AUTH_STORE: Lazy<Mutex<HashMap<String, AuthDotJson>>> =
 #[derive(Clone, Debug)]
 struct EphemeralAuthStorage {
     codex_home: PathBuf,
+    profile: Option<String>,
 }
 
 impl EphemeralAuthStorage {
-    fn new(codex_home: PathBuf) -> Self {
-        Self { codex_home }
+    fn new(codex_home: PathBuf, profile: Option<String>) -> Self {
+        Self {
+            codex_home,
+            profile,
+        }
     }
 
     fn with_store<F, T>(&self, action: F) -> std::io::Result<T>
     where
         F: FnOnce(&mut HashMap<String, AuthDotJson>, String) -> std::io::Result<T>,
     {
-        let key = compute_store_key(&self.codex_home)?;
+        let key = compute_store_key_for_profile(&self.codex_home, self.profile.as_deref())?;
         let mut store = EPHEMERAL_AUTH_STORE
             .lock()
             .map_err(|_| std::io::Error::other("failed to lock ephemeral auth storage"))?;
@@ -337,22 +405,42 @@ pub(super) fn create_auth_storage(
     codex_home: PathBuf,
     mode: AuthCredentialsStoreMode,
 ) -> Arc<dyn AuthStorageBackend> {
+    create_auth_storage_with_profile(codex_home, mode, active_auth_profile())
+}
+
+pub(super) fn create_unprofiled_auth_storage(
+    codex_home: PathBuf,
+    mode: AuthCredentialsStoreMode,
+) -> Arc<dyn AuthStorageBackend> {
+    create_auth_storage_with_profile(codex_home, mode, None)
+}
+
+fn create_auth_storage_with_profile(
+    codex_home: PathBuf,
+    mode: AuthCredentialsStoreMode,
+    profile: Option<String>,
+) -> Arc<dyn AuthStorageBackend> {
     let keyring_store: Arc<dyn KeyringStore> = Arc::new(DefaultKeyringStore);
-    create_auth_storage_with_keyring_store(codex_home, mode, keyring_store)
+    create_auth_storage_with_keyring_store(codex_home, mode, profile, keyring_store)
 }
 
 fn create_auth_storage_with_keyring_store(
     codex_home: PathBuf,
     mode: AuthCredentialsStoreMode,
+    profile: Option<String>,
     keyring_store: Arc<dyn KeyringStore>,
 ) -> Arc<dyn AuthStorageBackend> {
     match mode {
-        AuthCredentialsStoreMode::File => Arc::new(FileAuthStorage::new(codex_home)),
+        AuthCredentialsStoreMode::File => Arc::new(FileAuthStorage::new(codex_home, profile)),
         AuthCredentialsStoreMode::Keyring => {
-            Arc::new(KeyringAuthStorage::new(codex_home, keyring_store))
+            Arc::new(KeyringAuthStorage::new(codex_home, profile, keyring_store))
         }
-        AuthCredentialsStoreMode::Auto => Arc::new(AutoAuthStorage::new(codex_home, keyring_store)),
-        AuthCredentialsStoreMode::Ephemeral => Arc::new(EphemeralAuthStorage::new(codex_home)),
+        AuthCredentialsStoreMode::Auto => {
+            Arc::new(AutoAuthStorage::new(codex_home, profile, keyring_store))
+        }
+        AuthCredentialsStoreMode::Ephemeral => {
+            Arc::new(EphemeralAuthStorage::new(codex_home, profile))
+        }
     }
 }
 

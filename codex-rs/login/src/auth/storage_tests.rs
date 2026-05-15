@@ -12,7 +12,7 @@ use keyring::Error as KeyringError;
 #[tokio::test]
 async fn file_storage_load_returns_auth_dot_json() -> anyhow::Result<()> {
     let codex_home = tempdir()?;
-    let storage = FileAuthStorage::new(codex_home.path().to_path_buf());
+    let storage = FileAuthStorage::new(codex_home.path().to_path_buf(), None);
     let auth_dot_json = AuthDotJson {
         auth_mode: Some(AuthMode::ApiKey),
         openai_api_key: Some("test-key".to_string()),
@@ -33,7 +33,7 @@ async fn file_storage_load_returns_auth_dot_json() -> anyhow::Result<()> {
 #[tokio::test]
 async fn file_storage_save_persists_auth_dot_json() -> anyhow::Result<()> {
     let codex_home = tempdir()?;
-    let storage = FileAuthStorage::new(codex_home.path().to_path_buf());
+    let storage = FileAuthStorage::new(codex_home.path().to_path_buf(), None);
     let auth_dot_json = AuthDotJson {
         auth_mode: Some(AuthMode::ApiKey),
         openai_api_key: Some("test-key".to_string()),
@@ -55,9 +55,29 @@ async fn file_storage_save_persists_auth_dot_json() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
+async fn file_storage_profile_uses_separate_auth_file() -> anyhow::Result<()> {
+    let codex_home = tempdir()?;
+    let storage = FileAuthStorage::new(codex_home.path().to_path_buf(), Some("codexx".to_string()));
+    let auth_dot_json = AuthDotJson {
+        auth_mode: Some(AuthMode::ApiKey),
+        openai_api_key: Some("test-key".to_string()),
+        tokens: None,
+        last_refresh: Some(Utc::now()),
+        agent_identity: None,
+    };
+
+    storage.save(&auth_dot_json)?;
+
+    assert!(!codex_home.path().join("auth.json").exists());
+    assert!(codex_home.path().join("auth-codexx.json").exists());
+    assert_eq!(Some(auth_dot_json), storage.load()?);
+    Ok(())
+}
+
+#[tokio::test]
 async fn file_storage_round_trips_agent_identity_auth() -> anyhow::Result<()> {
     let codex_home = tempdir()?;
-    let storage = FileAuthStorage::new(codex_home.path().to_path_buf());
+    let storage = FileAuthStorage::new(codex_home.path().to_path_buf(), None);
     let agent_identity = jwt_with_payload(json!({
         "agent_runtime_id": "agent-runtime-id",
         "agent_private_key": "private-key",
@@ -85,7 +105,7 @@ async fn file_storage_round_trips_agent_identity_auth() -> anyhow::Result<()> {
 #[tokio::test]
 async fn file_storage_loads_agent_identity_as_jwt() -> anyhow::Result<()> {
     let codex_home = tempdir()?;
-    let storage = FileAuthStorage::new(codex_home.path().to_path_buf());
+    let storage = FileAuthStorage::new(codex_home.path().to_path_buf(), None);
     let agent_identity_jwt = jwt_with_payload(json!({
         "agent_runtime_id": "agent-runtime-id",
         "agent_private_key": "private-key",
@@ -126,7 +146,7 @@ fn file_storage_delete_removes_auth_file() -> anyhow::Result<()> {
     let storage = create_auth_storage(dir.path().to_path_buf(), AuthCredentialsStoreMode::File);
     storage.save(&auth_dot_json)?;
     assert!(dir.path().join("auth.json").exists());
-    let storage = FileAuthStorage::new(dir.path().to_path_buf());
+    let storage = FileAuthStorage::new(dir.path().to_path_buf(), None);
     let removed = storage.delete()?;
     assert!(removed);
     assert!(!dir.path().join("auth.json").exists());
@@ -262,6 +282,7 @@ fn keyring_auth_storage_load_returns_deserialized_auth() -> anyhow::Result<()> {
     let mock_keyring = MockKeyringStore::default();
     let storage = KeyringAuthStorage::new(
         codex_home.path().to_path_buf(),
+        None,
         Arc::new(mock_keyring.clone()),
     );
     let expected = AuthDotJson {
@@ -298,6 +319,7 @@ fn keyring_auth_storage_save_persists_and_removes_fallback_file() -> anyhow::Res
     let mock_keyring = MockKeyringStore::default();
     let storage = KeyringAuthStorage::new(
         codex_home.path().to_path_buf(),
+        None,
         Arc::new(mock_keyring.clone()),
     );
     let auth_file = get_auth_file(codex_home.path());
@@ -328,6 +350,7 @@ fn keyring_auth_storage_delete_removes_keyring_and_file() -> anyhow::Result<()> 
     let mock_keyring = MockKeyringStore::default();
     let storage = KeyringAuthStorage::new(
         codex_home.path().to_path_buf(),
+        None,
         Arc::new(mock_keyring.clone()),
     );
     let (key, auth_file) =
@@ -355,6 +378,7 @@ fn auto_auth_storage_load_prefers_keyring_value() -> anyhow::Result<()> {
     let mock_keyring = MockKeyringStore::default();
     let storage = AutoAuthStorage::new(
         codex_home.path().to_path_buf(),
+        None,
         Arc::new(mock_keyring.clone()),
     );
     let keyring_auth = auth_with_prefix("keyring");
@@ -376,7 +400,11 @@ fn auto_auth_storage_load_prefers_keyring_value() -> anyhow::Result<()> {
 fn auto_auth_storage_load_uses_file_when_keyring_empty() -> anyhow::Result<()> {
     let codex_home = tempdir()?;
     let mock_keyring = MockKeyringStore::default();
-    let storage = AutoAuthStorage::new(codex_home.path().to_path_buf(), Arc::new(mock_keyring));
+    let storage = AutoAuthStorage::new(
+        codex_home.path().to_path_buf(),
+        None,
+        Arc::new(mock_keyring),
+    );
 
     let expected = auth_with_prefix("file-only");
     storage.file_storage.save(&expected)?;
@@ -392,6 +420,7 @@ fn auto_auth_storage_load_falls_back_when_keyring_errors() -> anyhow::Result<()>
     let mock_keyring = MockKeyringStore::default();
     let storage = AutoAuthStorage::new(
         codex_home.path().to_path_buf(),
+        None,
         Arc::new(mock_keyring.clone()),
     );
     let key = compute_store_key(codex_home.path())?;
@@ -411,6 +440,7 @@ fn auto_auth_storage_save_prefers_keyring() -> anyhow::Result<()> {
     let mock_keyring = MockKeyringStore::default();
     let storage = AutoAuthStorage::new(
         codex_home.path().to_path_buf(),
+        None,
         Arc::new(mock_keyring.clone()),
     );
     let key = compute_store_key(codex_home.path())?;
@@ -436,6 +466,7 @@ fn auto_auth_storage_save_falls_back_when_keyring_errors() -> anyhow::Result<()>
     let mock_keyring = MockKeyringStore::default();
     let storage = AutoAuthStorage::new(
         codex_home.path().to_path_buf(),
+        None,
         Arc::new(mock_keyring.clone()),
     );
     let key = compute_store_key(codex_home.path())?;
@@ -467,6 +498,7 @@ fn auto_auth_storage_delete_removes_keyring_and_file() -> anyhow::Result<()> {
     let mock_keyring = MockKeyringStore::default();
     let storage = AutoAuthStorage::new(
         codex_home.path().to_path_buf(),
+        None,
         Arc::new(mock_keyring.clone()),
     );
     let (key, auth_file) =

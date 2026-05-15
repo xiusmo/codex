@@ -79,7 +79,7 @@ fn login_with_api_key_overwrites_existing_auth_json() {
     super::login_with_api_key(dir.path(), "sk-new", AuthCredentialsStoreMode::File)
         .expect("login_with_api_key should succeed");
 
-    let storage = FileAuthStorage::new(dir.path().to_path_buf());
+    let storage = FileAuthStorage::new(dir.path().to_path_buf(), None);
     let auth = storage
         .try_read_auth_json(&auth_path)
         .expect("auth.json should parse");
@@ -112,7 +112,7 @@ async fn login_with_access_token_writes_only_token() {
     .await
     .expect("login_with_access_token should succeed");
 
-    let storage = FileAuthStorage::new(dir.path().to_path_buf());
+    let storage = FileAuthStorage::new(dir.path().to_path_buf(), None);
     let auth = storage
         .try_read_auth_json(&auth_path)
         .expect("auth.json should parse");
