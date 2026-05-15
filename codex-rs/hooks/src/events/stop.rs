@@ -58,7 +58,7 @@ impl StopHookTarget {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct StopOutcome {
     pub hook_events: Vec<HookCompletedEvent>,
     pub should_stop: bool,

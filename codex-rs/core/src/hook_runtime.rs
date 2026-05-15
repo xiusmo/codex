@@ -120,13 +120,13 @@ pub(crate) async fn run_pending_session_start_hooks(
     };
 
     let target = match &turn_context.session_source {
-        SessionSource::SubAgent(SubAgentSource::ThreadSpawn { .. })
+        SessionSource::SubAgent(SubAgentSource::ThreadSpawn { agent_role, .. })
             if matches!(
                 session_start_source,
                 codex_hooks::SessionStartSource::Startup
             ) =>
         {
-            let metadata = subagent_hook_metadata(sess, turn_context);
+            let metadata = subagent_hook_metadata(sess, agent_role);
             SessionStartTarget::SubagentStart {
                 turn_id: turn_context.sub_id.clone(),
                 agent_id: metadata.agent_id,
@@ -303,13 +303,14 @@ pub(crate) async fn run_turn_stop_hooks(
     last_assistant_message: Option<String>,
 ) -> StopOutcome {
     let target = match &turn_context.session_source {
-        SessionSource::SubAgent(_) => {
-            let metadata = subagent_hook_metadata(sess, turn_context);
+        SessionSource::SubAgent(SubAgentSource::ThreadSpawn { agent_role, .. }) => {
+            let metadata = subagent_hook_metadata(sess, agent_role);
             StopHookTarget::SubagentStop {
                 agent_id: metadata.agent_id,
                 agent_type: metadata.agent_type,
             }
         }
+        SessionSource::SubAgent(_) => return StopOutcome::default(),
         _ => StopHookTarget::Stop,
     };
     let request = codex_hooks::StopRequest {
@@ -662,29 +663,15 @@ struct SubagentHookMetadata {
     agent_type: String,
 }
 
-fn subagent_hook_metadata(sess: &Arc<Session>, turn_context: &TurnContext) -> SubagentHookMetadata {
-    let agent_type = match &turn_context.session_source {
-        SessionSource::SubAgent(subagent_source) => subagent_hook_agent_type(subagent_source),
-        _ => crate::agent::role::DEFAULT_ROLE_NAME.to_string(),
-    };
+fn subagent_hook_metadata(
+    sess: &Arc<Session>,
+    agent_role: &Option<String>,
+) -> SubagentHookMetadata {
     SubagentHookMetadata {
         agent_id: sess.thread_id().to_string(),
-        agent_type,
-    }
-}
-
-// Hook `agent_type` mirrors the spawn_agent `agent_type` argument. Internally,
-// thread-spawned agents store that value as `agent_role`; omitted values use
-// the default role, while system subagents expose fixed type labels.
-fn subagent_hook_agent_type(subagent_source: &SubAgentSource) -> String {
-    match subagent_source {
-        SubAgentSource::ThreadSpawn { agent_role, .. } => agent_role
+        agent_type: agent_role
             .clone()
             .unwrap_or_else(|| crate::agent::role::DEFAULT_ROLE_NAME.to_string()),
-        SubAgentSource::Review => "review".to_string(),
-        SubAgentSource::Compact => "compact".to_string(),
-        SubAgentSource::MemoryConsolidation => "memory_consolidation".to_string(),
-        SubAgentSource::Other(value) => value.clone(),
     }
 }
 

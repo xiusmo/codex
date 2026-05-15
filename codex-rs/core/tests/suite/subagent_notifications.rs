@@ -1,9 +1,18 @@
 use anyhow::Result;
+use codex_core::StartThreadOptions;
 use codex_core::ThreadConfigSnapshot;
 use codex_core::config::AgentRoleConfig;
 use codex_features::Feature;
 use codex_protocol::ThreadId;
+use codex_protocol::models::PermissionProfile;
 use codex_protocol::openai_models::ReasoningEffort;
+use codex_protocol::protocol::AskForApproval;
+use codex_protocol::protocol::EventMsg;
+use codex_protocol::protocol::InitialHistory;
+use codex_protocol::protocol::Op;
+use codex_protocol::protocol::SessionSource;
+use codex_protocol::protocol::SubAgentSource;
+use codex_protocol::user_input::UserInput;
 use core_test_support::hooks::trust_discovered_hooks;
 use core_test_support::responses::ResponsesRequest;
 use core_test_support::responses::ev_assistant_message;
@@ -18,6 +27,8 @@ use core_test_support::responses::start_mock_server;
 use core_test_support::skip_if_no_network;
 use core_test_support::test_codex::TestCodex;
 use core_test_support::test_codex::test_codex;
+use core_test_support::test_codex::turn_permission_fields;
+use core_test_support::wait_for_event_match;
 use pretty_assertions::assert_eq;
 use serde_json::json;
 use std::fs;
@@ -40,6 +51,7 @@ const ROLE_MODEL: &str = "gpt-5.4";
 const ROLE_REASONING_EFFORT: ReasoningEffort = ReasoningEffort::High;
 const SUBAGENT_START_CONTEXT: &str = "subagent start context reaches child";
 const SUBAGENT_STOP_CONTINUATION: &str = "continue only the child";
+const INTERNAL_SUBAGENT_PROMPT: &str = "internal subagent: review";
 
 fn body_contains(req: &wiremock::Request, text: &str) -> bool {
     let is_zstd = req
@@ -113,7 +125,11 @@ fn write_home_skill(codex_home: &Path, dir: &str, name: &str, description: &str)
     Ok(())
 }
 
-fn write_subagent_lifecycle_hooks(home: &Path, stop_prompts: &[&str]) -> Result<()> {
+fn write_subagent_lifecycle_hooks(
+    home: &Path,
+    stop_prompts: &[&str],
+    subagent_stop_matcher: &str,
+) -> Result<()> {
     let session_start_script_path = home.join("session_start_hook.py");
     let session_start_log_path = home.join("session_start_hook_log.jsonl");
     let session_start_script = format!(
@@ -207,7 +223,7 @@ print(json.dumps({{"systemMessage": "root stop complete"}}))
                 }]
             }],
             "SubagentStop": [{
-                "matcher": "worker",
+                "matcher": subagent_stop_matcher,
                 "hooks": [{
                     "type": "command",
                     "command": format!("python3 {}", subagent_stop_script_path.display()),
@@ -459,6 +475,7 @@ async fn subagent_start_replaces_session_start_and_injects_context() -> Result<(
         |req: &wiremock::Request| {
             body_contains(req, CHILD_PROMPT)
                 && body_contains(req, SUBAGENT_START_CONTEXT)
+                && !body_contains(req, "<subagent_notification>")
                 && !body_contains(req, SPAWN_CALL_ID)
         },
         sse(vec![
@@ -482,7 +499,7 @@ async fn subagent_start_replaces_session_start_and_injects_context() -> Result<(
 
     let test = test_codex()
         .with_pre_build_hook(|home| {
-            if let Err(error) = write_subagent_lifecycle_hooks(home, &[]) {
+            if let Err(error) = write_subagent_lifecycle_hooks(home, &[], "worker") {
                 panic!("failed to write subagent hook fixture: {error}");
             }
         })
@@ -581,7 +598,8 @@ async fn subagent_stop_replaces_stop_and_can_continue_child() -> Result<()> {
 
     let test = test_codex()
         .with_pre_build_hook(|home| {
-            if let Err(error) = write_subagent_lifecycle_hooks(home, &[SUBAGENT_STOP_CONTINUATION])
+            if let Err(error) =
+                write_subagent_lifecycle_hooks(home, &[SUBAGENT_STOP_CONTINUATION], "worker")
             {
                 panic!("failed to write subagent hook fixture: {error}");
             }
@@ -630,6 +648,94 @@ async fn subagent_stop_replaces_stop_and_can_continue_child() -> Result<()> {
             .all(|input| input["last_assistant_message"].as_str() != Some("child done first")),
         "child completion should not invoke the normal Stop hook"
     );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn internal_subagent_turns_do_not_run_stop_hooks() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let server = start_mock_server().await;
+    let internal_request = mount_sse_once_match(
+        &server,
+        |req: &wiremock::Request| body_contains(req, INTERNAL_SUBAGENT_PROMPT),
+        sse(vec![
+            ev_response_created("resp-internal-1"),
+            ev_assistant_message("msg-internal-1", "internal subagent done"),
+            ev_completed("resp-internal-1"),
+        ]),
+    )
+    .await;
+
+    let test = test_codex()
+        .with_pre_build_hook(|home| {
+            if let Err(error) = write_subagent_lifecycle_hooks(home, &[], "review") {
+                panic!("failed to write subagent hook fixture: {error}");
+            }
+        })
+        .with_config(trust_discovered_hooks)
+        .build(&server)
+        .await?;
+
+    let internal_thread = test
+        .thread_manager
+        .start_thread_with_options(StartThreadOptions {
+            config: test.config.clone(),
+            initial_history: InitialHistory::New,
+            session_source: Some(SessionSource::SubAgent(SubAgentSource::Review)),
+            thread_source: None,
+            dynamic_tools: Vec::new(),
+            persist_extended_history: false,
+            metrics_service_name: None,
+            parent_trace: None,
+            environments: Vec::new(),
+        })
+        .await?;
+
+    let (sandbox_policy, permission_profile) =
+        turn_permission_fields(PermissionProfile::Disabled, test.cwd_path());
+    internal_thread
+        .thread
+        .submit(Op::UserTurn {
+            environments: None,
+            items: vec![UserInput::Text {
+                text: INTERNAL_SUBAGENT_PROMPT.to_string(),
+                text_elements: Vec::new(),
+            }],
+            final_output_json_schema: None,
+            cwd: test.config.cwd.to_path_buf(),
+            approval_policy: AskForApproval::Never,
+            approvals_reviewer: None,
+            sandbox_policy,
+            permission_profile,
+            model: internal_thread.session_configured.model.clone(),
+            effort: None,
+            summary: None,
+            service_tier: None,
+            collaboration_mode: None,
+            personality: None,
+        })
+        .await?;
+    let turn_id = wait_for_event_match(internal_thread.thread.as_ref(), |event| match event {
+        EventMsg::TurnStarted(event) => Some(event.turn_id.clone()),
+        _ => None,
+    })
+    .await;
+    wait_for_event_match(internal_thread.thread.as_ref(), |event| match event {
+        EventMsg::TurnComplete(event) if event.turn_id == turn_id => Some(()),
+        _ => None,
+    })
+    .await;
+    let requests = wait_for_requests(&internal_request).await?;
+    assert_eq!(requests.len(), 1);
+
+    let subagent_stop_inputs =
+        read_hook_log(test.codex_home_path(), "subagent_stop_hook_log.jsonl")?;
+    assert_eq!(subagent_stop_inputs, Vec::<serde_json::Value>::new());
+
+    let stop_inputs = read_hook_log(test.codex_home_path(), "stop_hook_log.jsonl")?;
+    assert_eq!(stop_inputs, Vec::<serde_json::Value>::new());
 
     Ok(())
 }
